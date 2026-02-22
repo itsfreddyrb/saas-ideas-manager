@@ -1,6 +1,7 @@
 import json
 import os
 import csv
+import time
 import requests
 import psycopg2
 import anthropic
@@ -11,8 +12,35 @@ load_dotenv()
 
 SOURCES = [
     'https://www.reddit.com/r/SaaS/.json',
+    'https://www.reddit.com/r/entrepreneur/.json',
     'https://hacker-news.firebaseio.com/v0/newstories.json',
 ]
+
+REDDIT_SOURCE_NAMES = {
+    'https://www.reddit.com/r/SaaS/.json': 'Reddit r/SaaS',
+    'https://www.reddit.com/r/entrepreneur/.json': 'Reddit r/entrepreneur',
+}
+
+VALIDATION_SYSTEM_PROMPT = """You are an extremely strict filter. Your ONLY job is to determine if a post contains a specific, concrete SaaS or software product idea that someone could build.
+
+To pass, the post MUST explicitly describe a specific product, tool, or software service — including what it does, who it's for, or what problem it solves. The idea must be clear enough that a developer could start building it.
+
+REJECT everything else. When in doubt, REJECT. Specifically reject:
+- Personal stories, journeys, or "how I built X" retrospectives
+- Success stories, case studies, or revenue milestone posts
+- Questions, advice requests, or discussions of any kind
+- Rants, opinions, hot takes, or market commentary
+- Job postings, promotions, self-promotion, or "check out my tool" posts
+- Surveys, polls, meta posts, or community threads
+- Vague statements like "I want to build a SaaS" without describing what it does
+- Posts about existing/already-launched products (these are NOT ideas)
+- Aggregation posts like "here are some ideas" or "top picks this week"
+
+Return ONLY a JSON object with exactly these fields:
+- "is_idea": true or false
+- "reason": A short (1 sentence) explanation of your decision
+
+Return ONLY the JSON object, no markdown fences, no extra text."""
 
 ANALYSIS_SYSTEM_PROMPT = """You are a seasoned SaaS startup advisor. You evaluate SaaS product ideas for solo developers and small teams.
 
@@ -31,7 +59,24 @@ Given a SaaS idea, return a JSON object with exactly these fields:
 Return ONLY the JSON object, no markdown fences, no extra text."""
 
 
-def parse_reddit_response(data):
+def validate_idea_with_llm(client, title, description):
+    user_prompt = f"Title: {title}\nDescription: {description or 'No description provided'}"
+
+    message = client.messages.create(
+        model="claude-haiku-4-5-20251001",
+        max_tokens=256,
+        system=VALIDATION_SYSTEM_PROMPT,
+        messages=[{"role": "user", "content": user_prompt}],
+    )
+
+    raw = message.content[0].text.strip()
+    if raw.startswith("```"):
+        raw = raw.split("\n", 1)[1].rsplit("```", 1)[0].strip()
+    result = json.loads(raw)
+    return result.get("is_idea", False), result.get("reason", "")
+
+
+def parse_reddit_response(data, source_name='Reddit r/SaaS'):
     ideas = []
     for post in data.get('data', {}).get('children', []):
         post_data = post.get('data', {})
@@ -41,7 +86,7 @@ def parse_reddit_response(data):
             'difficulty': None,
             'effort_est': None,
             'monetization': None,
-            'source': 'Reddit r/SaaS',
+            'source': source_name,
             'date_found': None,
             'notes': None,
         })
@@ -80,6 +125,8 @@ def insert_idea(cursor, idea):
 
 
 def fetch_and_insert_ideas(conn):
+    client = anthropic.Anthropic()
+
     for source in SOURCES:
         try:
             response = requests.get(source, headers={'User-Agent': 'saas-ideas-bot/1.0'})
@@ -88,18 +135,34 @@ def fetch_and_insert_ideas(conn):
                 continue
 
             ideas = []
-            if source == 'https://www.reddit.com/r/SaaS/.json':
-                ideas = parse_reddit_response(response.json())
+            if source in REDDIT_SOURCE_NAMES:
+                ideas = parse_reddit_response(response.json(), REDDIT_SOURCE_NAMES[source])
             elif source == 'https://hacker-news.firebaseio.com/v0/newstories.json':
                 ideas = parse_hacker_news_response(response.json())
 
             with conn.cursor() as cursor:
                 inserted = 0
-                for idea in ideas:
+                skipped_validation = 0
+                for i, idea in enumerate(ideas):
+                    if i > 0:
+                        time.sleep(1.5)
+                    try:
+                        is_idea, reason = validate_idea_with_llm(client, idea['title'], idea['description'])
+                    except Exception as e:
+                        print(f"  Validation error for '{idea['title'][:60]}': {e} — skipping")
+                        skipped_validation += 1
+                        continue
+
+                    if not is_idea:
+                        print(f"  Rejected: {idea['title'][:60]} — {reason}")
+                        skipped_validation += 1
+                        continue
+
+                    print(f"  Accepted: {idea['title'][:60]}")
                     if insert_idea(cursor, idea):
                         inserted += 1
             conn.commit()
-            print(f"Fetched {len(ideas)} ideas from {source}, inserted {inserted} new")
+            print(f"Fetched {len(ideas)} from {source}, accepted {len(ideas) - skipped_validation}, inserted {inserted} new")
         except Exception as e:
             conn.rollback()
             print(f"Error fetching from {source}: {e}")
@@ -177,7 +240,9 @@ def analyze_ideas(conn):
 
     print(f"\nAnalyzing {len(unanalyzed)} ideas with Claude...")
 
-    for idea_row in unanalyzed:
+    for i, idea_row in enumerate(unanalyzed):
+        if i > 0:
+            time.sleep(1.5)
         idea_id = idea_row[0]
         title = idea_row[1]
         try:
