@@ -69,9 +69,9 @@ def validate_job_with_llm(client, title, description):
     user_prompt = f"Title: {title}\nDescription: {description or 'No description provided'}"
 
     message = client.messages.create(
-        model="claude-haiku-4-5-20251001",
+        model="claude-3-haiku-20240307",
         max_tokens=256,
-        system=JOB_VALIDATION_SYSTEM_PROMPT,
+        system=[{"type": "text", "text": JOB_VALIDATION_SYSTEM_PROMPT, "cache_control": {"type": "ephemeral"}}],
         messages=[{"role": "user", "content": user_prompt}],
     )
 
@@ -265,9 +265,9 @@ Location: {location or 'Remote'}
 Source: {source or 'Unknown'}"""
 
     message = client.messages.create(
-        model="claude-haiku-4-5-20251001",
+        model="claude-3-haiku-20240307",
         max_tokens=1024,
-        system=JOB_ANALYSIS_SYSTEM_PROMPT,
+        system=[{"type": "text", "text": JOB_ANALYSIS_SYSTEM_PROMPT, "cache_control": {"type": "ephemeral"}}],
         messages=[{"role": "user", "content": user_prompt}],
     )
 

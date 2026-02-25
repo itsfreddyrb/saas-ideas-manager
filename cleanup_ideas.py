@@ -33,9 +33,9 @@ def validate_idea_with_llm(client, title, description):
     user_prompt = f"Title: {title}\nDescription: {description or 'No description provided'}"
 
     message = client.messages.create(
-        model="claude-haiku-4-5-20251001",
+        model="claude-3-haiku-20240307",
         max_tokens=256,
-        system=VALIDATION_SYSTEM_PROMPT,
+        system=[{"type": "text", "text": VALIDATION_SYSTEM_PROMPT, "cache_control": {"type": "ephemeral"}}],
         messages=[{"role": "user", "content": user_prompt}],
     )
 
