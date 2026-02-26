@@ -4,10 +4,64 @@ import csv
 import time
 import requests
 import psycopg2
-import anthropic
 from dotenv import load_dotenv
 
 load_dotenv()
+
+OLLAMA_MODEL = "minimax-m2.5:cloud"
+OLLAMA_URL = "http://localhost:11434/api/generate"
+
+
+def call_ollama(system_prompt, user_prompt, max_tokens=1024, retries=2):
+    """Call Ollama API with the minimax model."""
+    full_prompt = f"System: {system_prompt}\n\nUser: {user_prompt}"
+    
+    for attempt in range(retries):
+        try:
+            response = requests.post(
+                OLLAMA_URL,
+                json={
+                    "model": OLLAMA_MODEL,
+                    "prompt": full_prompt,
+                    "stream": False,
+                    "format": "json",
+                    "options": {
+                        "num_predict": max_tokens
+                    }
+                },
+                timeout=60
+            )
+            if response.status_code != 200:
+                print(f"    Ollama API error: {response.status_code} - {response.text[:100]}")
+                continue
+                
+            result = response.json()
+            raw = result.get('response', '').strip()
+            
+            # Remove markdown fences if present
+            if raw.startswith("```"):
+                raw = raw.split("\n", 1)[1].rsplit("```", 1)[0].strip()
+            
+            # Try to parse JSON, if fails, try to extract JSON from text
+            try:
+                return json.loads(raw)
+            except json.JSONDecodeError:
+                # Try to find JSON in the response
+                json_match = re.search(r'\{[^{}]*\}', raw, re.DOTALL)
+                if json_match:
+                    return json.loads(json_match.group())
+                print(f"    Failed to parse JSON, attempt {attempt + 1}/{retries}")
+                continue
+                
+        except requests.exceptions.Timeout:
+            print(f"    Ollama timeout, attempt {attempt + 1}/{retries}")
+            continue
+        except Exception as e:
+            print(f"    Ollama error: {e}, attempt {attempt + 1}/{retries}")
+            continue
+    
+    # Return a safe default if all retries fail
+    return {"is_idea": False, "reason": "LLM call failed"}
 
 
 SOURCES = [
@@ -59,20 +113,10 @@ Given a SaaS idea, return a JSON object with exactly these fields:
 Return ONLY the JSON object, no markdown fences, no extra text."""
 
 
-def validate_idea_with_llm(client, title, description):
+def validate_idea_with_llm(title, description):
     user_prompt = f"Title: {title}\nDescription: {description or 'No description provided'}"
 
-    message = client.messages.create(
-        model="claude-3-haiku-20240307",
-        max_tokens=256,
-        system=[{"type": "text", "text": VALIDATION_SYSTEM_PROMPT, "cache_control": {"type": "ephemeral"}}],
-        messages=[{"role": "user", "content": user_prompt}],
-    )
-
-    raw = message.content[0].text.strip()
-    if raw.startswith("```"):
-        raw = raw.split("\n", 1)[1].rsplit("```", 1)[0].strip()
-    result = json.loads(raw)
+    result = call_ollama(VALIDATION_SYSTEM_PROMPT, user_prompt, max_tokens=256)
     return result.get("is_idea", False), result.get("reason", "")
 
 
@@ -125,8 +169,6 @@ def insert_idea(cursor, idea):
 
 
 def fetch_and_insert_ideas(conn):
-    client = anthropic.Anthropic()
-
     for source in SOURCES:
         try:
             response = requests.get(source, headers={'User-Agent': 'saas-ideas-bot/1.0'})
@@ -147,7 +189,7 @@ def fetch_and_insert_ideas(conn):
                     if i > 0:
                         time.sleep(1.5)
                     try:
-                        is_idea, reason = validate_idea_with_llm(client, idea['title'], idea['description'])
+                        is_idea, reason = validate_idea_with_llm(idea['title'], idea['description'])
                     except Exception as e:
                         print(f"  Validation error for '{idea['title'][:60]}': {e} — skipping")
                         skipped_validation += 1
@@ -191,7 +233,7 @@ def ensure_analysis_table(conn):
     conn.commit()
 
 
-def analyze_idea_with_llm(client, idea_row):
+def analyze_idea_with_llm(idea_row):
     idea_id, title, description, difficulty, effort_est, monetization, source = idea_row
 
     user_prompt = f"""Evaluate this SaaS idea:
@@ -203,26 +245,11 @@ Estimated effort (hours): {effort_est or 'Unknown'}
 Current monetization idea: {monetization or 'None'}
 Source: {source or 'Unknown'}"""
 
-    message = client.messages.create(
-        model="claude-3-haiku-20240307",
-        max_tokens=1024,
-        system=[{"type": "text", "text": ANALYSIS_SYSTEM_PROMPT, "cache_control": {"type": "ephemeral"}}],
-        messages=[{"role": "user", "content": user_prompt}],
-    )
-
-    if not message.content:
-        raise ValueError(f"Empty response from API (stop_reason: {message.stop_reason})")
-    raw = message.content[0].text.strip()
-    if not raw:
-        raise ValueError(f"Empty text in response (stop_reason: {message.stop_reason})")
-    if raw.startswith("```"):
-        raw = raw.split("\n", 1)[1].rsplit("```", 1)[0].strip()
-    return json.loads(raw)
+    result = call_ollama(ANALYSIS_SYSTEM_PROMPT, user_prompt, max_tokens=1024)
+    return result
 
 
 def analyze_ideas(conn):
-    client = anthropic.Anthropic()
-
     ensure_analysis_table(conn)
 
     with conn.cursor() as cursor:
@@ -238,7 +265,7 @@ def analyze_ideas(conn):
         print("All ideas have already been analyzed.")
         return
 
-    print(f"\nAnalyzing {len(unanalyzed)} ideas with Claude...")
+    print(f"\nAnalyzing {len(unanalyzed)} ideas with Ollama ({OLLAMA_MODEL})...")
 
     for i, idea_row in enumerate(unanalyzed):
         if i > 0:
@@ -246,7 +273,7 @@ def analyze_ideas(conn):
         idea_id = idea_row[0]
         title = idea_row[1]
         try:
-            analysis = analyze_idea_with_llm(client, idea_row)
+            analysis = analyze_idea_with_llm(idea_row)
             with conn.cursor() as cursor:
                 cursor.execute(
                     "INSERT INTO idea_analysis "
