@@ -4,10 +4,65 @@ import re
 import time
 import requests
 import psycopg2
-import anthropic
 from dotenv import load_dotenv
 
 load_dotenv()
+
+OLLAMA_MODEL = "minimax-m2.5:cloud"
+OLLAMA_URL = "http://localhost:11434/api/generate"
+
+
+def call_ollama(system_prompt, user_prompt, max_tokens=1024, retries=2):
+    """Call Ollama API with the minimax model."""
+    full_prompt = f"System: {system_prompt}\n\nUser: {user_prompt}"
+    
+    for attempt in range(retries):
+        try:
+            response = requests.post(
+                OLLAMA_URL,
+                json={
+                    "model": OLLAMA_MODEL,
+                    "prompt": full_prompt,
+                    "stream": False,
+                    "format": "json",
+                    "options": {
+                        "num_predict": max_tokens
+                    }
+                },
+                timeout=60
+            )
+            if response.status_code != 200:
+                print(f"    Ollama API error: {response.status_code} - {response.text[:100]}")
+                continue
+                
+            result = response.json()
+            raw = result.get('response', '').strip()
+            
+            # Remove markdown fences if present
+            if raw.startswith("```"):
+                raw = raw.split("\n", 1)[1].rsplit("```", 1)[0].strip()
+            
+            # Try to parse JSON, if fails, try to extract JSON from text
+            try:
+                return json.loads(raw)
+            except json.JSONDecodeError:
+                # Try to find JSON in the response
+                import re
+                json_match = re.search(r'\{[^{}]*\}', raw, re.DOTALL)
+                if json_match:
+                    return json.loads(json_match.group())
+                print(f"    Failed to parse JSON, attempt {attempt + 1}/{retries}")
+                continue
+                
+        except requests.exceptions.Timeout:
+            print(f"    Ollama timeout, attempt {attempt + 1}/{retries}")
+            continue
+        except Exception as e:
+            print(f"    Ollama error: {e}, attempt {attempt + 1}/{retries}")
+            continue
+    
+    # Return a safe default if all retries fail
+    return {"is_job": False, "reason": "LLM call failed"}
 
 
 JOB_SOURCES = [
@@ -65,20 +120,10 @@ def strip_html(text):
     return clean
 
 
-def validate_job_with_llm(client, title, description):
+def validate_job_with_llm(title, description):
     user_prompt = f"Title: {title}\nDescription: {description or 'No description provided'}"
 
-    message = client.messages.create(
-        model="claude-3-haiku-20240307",
-        max_tokens=256,
-        system=[{"type": "text", "text": JOB_VALIDATION_SYSTEM_PROMPT, "cache_control": {"type": "ephemeral"}}],
-        messages=[{"role": "user", "content": user_prompt}],
-    )
-
-    raw = message.content[0].text.strip()
-    if raw.startswith("```"):
-        raw = raw.split("\n", 1)[1].rsplit("```", 1)[0].strip()
-    result = json.loads(raw)
+    result = call_ollama(JOB_VALIDATION_SYSTEM_PROMPT, user_prompt, max_tokens=256)
     return result.get("is_job", False), result.get("reason", "")
 
 
@@ -206,8 +251,6 @@ def ensure_job_tables(conn):
 
 
 def fetch_and_insert_jobs(conn):
-    client = anthropic.Anthropic()
-
     for source in JOB_SOURCES:
         try:
             response = requests.get(source, headers={'User-Agent': 'saas-ideas-bot/1.0'})
@@ -230,7 +273,7 @@ def fetch_and_insert_jobs(conn):
                     if i > 0:
                         time.sleep(1.5)
                     try:
-                        is_job, reason = validate_job_with_llm(client, job['title'], job['description'])
+                        is_job, reason = validate_job_with_llm(job['title'], job['description'])
                     except Exception as e:
                         print(f"  Validation error for '{job['title'][:60]}': {e} — skipping")
                         skipped += 1
@@ -251,7 +294,7 @@ def fetch_and_insert_jobs(conn):
             print(f"Error fetching from {source}: {e}")
 
 
-def analyze_job_with_llm(client, job_row):
+def analyze_job_with_llm(job_row):
     job_id, title, company, description, salary, job_type, location, source, url = job_row
 
     user_prompt = f"""Evaluate this remote job posting:
@@ -264,22 +307,11 @@ Type: {job_type or 'Unknown'}
 Location: {location or 'Remote'}
 Source: {source or 'Unknown'}"""
 
-    message = client.messages.create(
-        model="claude-3-haiku-20240307",
-        max_tokens=1024,
-        system=[{"type": "text", "text": JOB_ANALYSIS_SYSTEM_PROMPT, "cache_control": {"type": "ephemeral"}}],
-        messages=[{"role": "user", "content": user_prompt}],
-    )
-
-    raw = message.content[0].text.strip()
-    if raw.startswith("```"):
-        raw = raw.split("\n", 1)[1].rsplit("```", 1)[0].strip()
-    return json.loads(raw)
+    result = call_ollama(JOB_ANALYSIS_SYSTEM_PROMPT, user_prompt, max_tokens=1024)
+    return result
 
 
 def analyze_jobs(conn):
-    client = anthropic.Anthropic()
-
     with conn.cursor() as cursor:
         cursor.execute("""
             SELECT j.id, j.title, j.company, j.description, j.salary,
@@ -294,7 +326,7 @@ def analyze_jobs(conn):
         print("All jobs have already been analyzed.")
         return
 
-    print(f"\nAnalyzing {len(unanalyzed)} jobs with Claude...")
+    print(f"\nAnalyzing {len(unanalyzed)} jobs with Ollama ({OLLAMA_MODEL})...")
 
     for i, job_row in enumerate(unanalyzed):
         if i > 0:
@@ -302,7 +334,7 @@ def analyze_jobs(conn):
         job_id = job_row[0]
         title = job_row[1]
         try:
-            analysis = analyze_job_with_llm(client, job_row)
+            analysis = analyze_job_with_llm(job_row)
             with conn.cursor() as cursor:
                 cursor.execute(
                     "INSERT INTO job_analysis "
